@@ -5,8 +5,6 @@ Queries Wayback Machine, archive.ph, Common Crawl, and Arquivo.pt in fallback or
 
 ## Install
 
-**Pre-built binary** — download from [Releases](https://github.com/Necr00/waybackdown/releases).
-
 **From source** (requires Go 1.21+):
 ```bash
 go install github.com/NeCr00/Waybackdown@latest
