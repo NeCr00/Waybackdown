@@ -123,23 +123,25 @@ func (d *Display) Banner(mode, providers string) {
 	fmt.Println()
 }
 
-// Start draws the initial progress bar (TTY) or prints an opening status line
-// (plain), then launches a background goroutine that keeps stats visible.
+// Start draws the initial progress bar and launches background goroutines that
+// keep stats visible for the entire duration of the run:
 //
-//   - TTY mode:   bar redrawn every 120 ms; spinner rotates to signal activity.
-//   - Plain mode: status line written to stderr every 5 s so the user always
-//     sees progress even when stdout is piped or redirected.
+//   - TTY mode:   ANSI bar on stdout redrawn every 120 ms with a spinning indicator.
+//   - Always:     plain status line written to stderr every 5 s so progress is
+//     visible even when stdout is piped, redirected, or the terminal does not
+//     support ANSI (e.g. tmux with unusual settings, script(1), CI runners).
 func (d *Display) Start() {
 	d.stopTick = make(chan struct{})
-	d.tickWg.Add(1)
 
 	if d.color {
-		// Draw the initial bar immediately so something is visible right away.
+		// Draw the initial bar immediately.
 		d.mu.Lock()
 		d.clearLine()
 		d.redraw()
 		d.mu.Unlock()
 
+		// TTY ticker: redraws the animated bar every 120 ms.
+		d.tickWg.Add(1)
 		go func() {
 			defer d.tickWg.Done()
 			t := time.NewTicker(120 * time.Millisecond)
@@ -160,28 +162,30 @@ func (d *Display) Start() {
 				}
 			}
 		}()
-	} else {
-		// Plain mode: emit a status line to stderr every 5 seconds.
-		go func() {
-			defer d.tickWg.Done()
-			t := time.NewTicker(5 * time.Second)
-			defer t.Stop()
-			for {
-				select {
-				case <-d.stopTick:
-					return
-				case <-t.C:
-					d.mu.Lock()
-					if d.stopped {
-						d.mu.Unlock()
-						return
-					}
-					d.stderrStatus()
-					d.mu.Unlock()
-				}
-			}
-		}()
 	}
+
+	// Stderr ticker: always runs, writes a plain status line every 5 s.
+	// This is the safety net that ensures the user always sees activity.
+	d.tickWg.Add(1)
+	go func() {
+		defer d.tickWg.Done()
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-d.stopTick:
+				return
+			case <-t.C:
+				d.mu.Lock()
+				if d.stopped {
+					d.mu.Unlock()
+					return
+				}
+				d.stderrStatus()
+				d.mu.Unlock()
+			}
+		}
+	}()
 }
 
 // Stop halts the background ticker and blocks until it has fully exited,
@@ -237,17 +241,15 @@ func (d *Display) Fail(url string, err error) {
 	d.redraw()
 }
 
-// Skip records a skipped URL. Always redraws the bar so the counter stays
-// current even when verbose output is off.
-func (d *Display) Skip(url, reason string, verbose bool) {
+// Skip records and prints a skipped URL (no archive found or invalid URL).
+// Always printed — this is a result, not a verbose diagnostic.
+func (d *Display) Skip(url, reason string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.doneURLs++
 	d.skipURLs++
 	d.clearLine()
-	if verbose {
-		fmt.Printf("%s  %s  %s\n", d.c(gray, "[~]"), url, d.c(gray, reason))
-	}
+	fmt.Printf("%s  %s  %s\n", d.c(gray, "[~]"), url, d.c(gray, reason))
 	d.redraw()
 }
 

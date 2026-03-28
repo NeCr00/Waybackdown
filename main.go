@@ -122,7 +122,7 @@ submitLoop:
 		case r.err != nil:
 			disp.Fail(r.url, r.err)
 		case r.skipped:
-			disp.Skip(r.url, r.reason, cfg.Verbose)
+			disp.Skip(r.url, r.reason)
 		default:
 			disp.Ok(r.url, r.newFiles, r.cached, r.dlFailed)
 		}
