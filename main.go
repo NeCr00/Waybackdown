@@ -85,6 +85,23 @@ func main() {
 	sem := make(chan struct{}, cfg.Concurrency)
 	var wg sync.WaitGroup
 
+	// Consumer runs concurrently with the submit loop so results appear in
+	// real time instead of only after all URLs have been dispatched.
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		for r := range results {
+			switch {
+			case r.err != nil:
+				disp.Fail(r.url, r.err)
+			case r.skipped:
+				disp.Skip(r.url, r.reason)
+			default:
+				disp.Ok(r.url, r.newFiles, r.cached, r.dlFailed)
+			}
+		}
+	}()
+
 submitLoop:
 	for _, u := range urls {
 		select {
@@ -112,21 +129,10 @@ submitLoop:
 		}(u)
 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	for r := range results {
-		switch {
-		case r.err != nil:
-			disp.Fail(r.url, r.err)
-		case r.skipped:
-			disp.Skip(r.url, r.reason)
-		default:
-			disp.Ok(r.url, r.newFiles, r.cached, r.dlFailed)
-		}
-	}
+	// Wait for all workers, then signal the consumer to exit.
+	wg.Wait()
+	close(results)
+	<-consumerDone
 
 	disp.Stop()
 	disp.Summary()
