@@ -1,5 +1,9 @@
 // Package ui handles all terminal output: colored result lines and a live
 // progress bar. All methods are safe for concurrent use.
+//
+// TTY mode  (stdout is a terminal): animated ANSI progress bar redrawn in place.
+// Plain mode (stdout is piped/redirected): plain-text result lines to stdout +
+// periodic status lines to stderr every 5 s so progress is always visible.
 package ui
 
 import (
@@ -7,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -21,11 +26,18 @@ const (
 	boldGreen = "\033[1;32m"
 )
 
+var spinFrames = []string{"|", "/", "-", "\\"}
+
 // Display manages colored output and a live progress bar.
 type Display struct {
-	total int
-	color bool
-	mu    sync.Mutex
+	total   int
+	color   bool       // true  → TTY mode (ANSI bar)
+	stopped bool       // set by Stop(); prevents ticker from drawing after summary
+	tickWg  sync.WaitGroup
+	mu      sync.Mutex
+
+	stopTick chan struct{}
+	spinIdx  int // protected by mu
 
 	// live counters (protected by mu)
 	doneURLs    int
@@ -38,14 +50,14 @@ type Display struct {
 }
 
 // New creates a Display for total URLs.
-// Color and the progress bar are enabled only when stdout is a TTY.
 func New(total int) *Display {
-	fi, _ := os.Stdout.Stat()
 	return &Display{
 		total: total,
-		color: fi.Mode()&os.ModeCharDevice != 0,
+		color: isTTY(), // platform-specific: tty_unix.go / tty_windows.go
 	}
 }
+
+// ── internal helpers ─────────────────────────────────────────────────────────
 
 func (d *Display) c(code, s string) string {
 	if !d.color {
@@ -54,26 +66,38 @@ func (d *Display) c(code, s string) string {
 	return code + s + reset
 }
 
-// clearLine erases the current progress bar line (must be called with mu held).
+// clearLine erases the progress bar line (TTY mode, must be called with mu held).
 func (d *Display) clearLine() {
 	if d.color {
 		fmt.Print("\r\033[K")
 	}
 }
 
-// redraw repaints the progress bar in place (must be called with mu held).
+// redraw repaints the progress bar in place (TTY mode, must be called with mu held).
 func (d *Display) redraw() {
 	if !d.color {
 		return
 	}
-	bar := makeBar(d.doneURLs, d.total, 20)
-	fmt.Printf("%s  %s%d/%d%s  ↓ %s  ✓ %s  ✗ %s  ◌ %s",
-		bar,
+	d.spinIdx++
+	spin := d.c(cyan, spinFrames[d.spinIdx%len(spinFrames)])
+	bar := makeBar(d.doneURLs, d.total, 18)
+	fmt.Printf("%s %s  %s%d/%d%s  ↓ %s  ✓ %s  ✗ %s  ◌ %s",
+		spin, bar,
 		bold, d.doneURLs, d.total, reset,
 		d.c(green, fmt.Sprintf("%d new", d.newFiles)),
 		d.c(cyan, fmt.Sprintf("%d cached", d.cachedFiles)),
 		d.c(red, fmt.Sprintf("%d failed", d.dlFailed+d.failURLs)),
 		d.c(gray, fmt.Sprintf("%d skipped", d.skipURLs)),
+	)
+}
+
+// stderrStatus prints a plain-text status line to stderr (plain mode).
+// Must be called with mu held.
+func (d *Display) stderrStatus() {
+	fmt.Fprintf(os.Stderr, "[status] %d/%d URLs  ↓ %d new  ✓ %d cached  ✗ %d failed  ◌ %d skipped\n",
+		d.doneURLs, d.total,
+		d.newFiles, d.cachedFiles,
+		d.dlFailed+d.failURLs, d.skipURLs,
 	)
 }
 
@@ -89,12 +113,90 @@ func makeBar(done, total, width int) string {
 		"\033[90m" + strings.Repeat("░", width-filled) + reset
 }
 
+// ── public API ────────────────────────────────────────────────────────────────
+
 // Banner prints the startup header.
 func (d *Display) Banner(mode, providers string) {
 	fmt.Printf("\n%s  %d URL(s)  ·  mode: %s  ·  providers: %s\n",
 		d.c(bold, "waybackdown"), d.total, mode, providers)
 	fmt.Println(d.c(gray, strings.Repeat("─", 72)))
 	fmt.Println()
+}
+
+// Start draws the initial progress bar (TTY) or prints an opening status line
+// (plain), then launches a background goroutine that keeps stats visible.
+//
+//   - TTY mode:   bar redrawn every 120 ms; spinner rotates to signal activity.
+//   - Plain mode: status line written to stderr every 5 s so the user always
+//     sees progress even when stdout is piped or redirected.
+func (d *Display) Start() {
+	d.stopTick = make(chan struct{})
+	d.tickWg.Add(1)
+
+	if d.color {
+		// Draw the initial bar immediately so something is visible right away.
+		d.mu.Lock()
+		d.clearLine()
+		d.redraw()
+		d.mu.Unlock()
+
+		go func() {
+			defer d.tickWg.Done()
+			t := time.NewTicker(120 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-d.stopTick:
+					return
+				case <-t.C:
+					d.mu.Lock()
+					if d.stopped {
+						d.mu.Unlock()
+						return
+					}
+					d.clearLine()
+					d.redraw()
+					d.mu.Unlock()
+				}
+			}
+		}()
+	} else {
+		// Plain mode: emit a status line to stderr every 5 seconds.
+		go func() {
+			defer d.tickWg.Done()
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-d.stopTick:
+					return
+				case <-t.C:
+					d.mu.Lock()
+					if d.stopped {
+						d.mu.Unlock()
+						return
+					}
+					d.stderrStatus()
+					d.mu.Unlock()
+				}
+			}
+		}()
+	}
+}
+
+// Stop halts the background ticker and blocks until it has fully exited,
+// guaranteeing that Summary() is never overwritten by a stray redraw.
+func (d *Display) Stop() {
+	if d.stopTick == nil {
+		return
+	}
+	d.mu.Lock()
+	d.stopped = true
+	d.mu.Unlock()
+
+	close(d.stopTick)
+	d.tickWg.Wait()
+	d.stopTick = nil
 }
 
 // Ok records and prints a successfully-processed URL.
@@ -135,17 +237,18 @@ func (d *Display) Fail(url string, err error) {
 	d.redraw()
 }
 
-// Skip records and optionally prints a skipped URL.
+// Skip records a skipped URL. Always redraws the bar so the counter stays
+// current even when verbose output is off.
 func (d *Display) Skip(url, reason string, verbose bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.doneURLs++
 	d.skipURLs++
+	d.clearLine()
 	if verbose {
-		d.clearLine()
 		fmt.Printf("%s  %s  %s\n", d.c(gray, "[~]"), url, d.c(gray, reason))
-		d.redraw()
 	}
+	d.redraw()
 }
 
 // Info prints a verbose informational line (goroutine-safe).

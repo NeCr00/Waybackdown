@@ -55,6 +55,7 @@ func main() {
 
 	disp := ui.New(len(urls))
 	disp.Banner(cfg.Mode, cfg.Providers)
+	disp.Start()
 
 	if cfg.Verbose {
 		disp.Info("rate limiter: %.1f req/s, burst %d", cfg.RPS, cfg.BurstSize)
@@ -127,6 +128,7 @@ submitLoop:
 		}
 	}
 
+	disp.Stop()
 	disp.Summary(cfg.OutputDir)
 }
 
