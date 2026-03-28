@@ -71,7 +71,7 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "\nNotes:\n")
 		fmt.Fprintf(os.Stderr, "  -status \"\"   downloads ALL archived responses (404, 403, 302 etc.) [default]\n")
 		fmt.Fprintf(os.Stderr, "  -status 200  downloads only successful 200 OK capture\n")
-		fmt.Fprintf(os.Stderr, "  -mode all    downloads every unique content versions\n")
+		fmt.Fprintf(os.Stderr, "  -mode all    downloads every content version\n")
 	}
 
 	flag.Parse()
