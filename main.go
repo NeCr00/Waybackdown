@@ -53,7 +53,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	disp := ui.New(len(urls))
+	disp := ui.New(len(urls), cfg.OutputDir)
 	disp.Banner(cfg.Mode, cfg.Providers)
 	disp.Start()
 
@@ -129,7 +129,7 @@ submitLoop:
 	}
 
 	disp.Stop()
-	disp.Summary(cfg.OutputDir)
+	disp.Summary()
 }
 
 // contentFetcher is an optional interface for providers that use custom
