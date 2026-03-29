@@ -78,6 +78,16 @@ func New(cfg *config.Config, opts ...Option) *Client {
 // Name implements provider.Provider.
 func (c *Client) Name() string { return "wayback" }
 
+// logf routes a verbose message through cfg.LogVerbose (the display's Info
+// method in TTY mode) or directly to stderr as a fallback.
+func (c *Client) logf(format string, args ...any) {
+	if c.cfg.LogVerbose != nil {
+		c.cfg.LogVerbose(format, args...)
+	} else {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
 // FetchSnapshots queries the CDX API for all snapshots of the given URL.
 // If no results are found, it automatically retries with the alternate
 // scheme (https→http or http→https) to cover old sites archived before HTTPS.
@@ -92,13 +102,13 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 		alt := normalize.ToggleScheme(rawURL)
 		if alt != rawURL {
 			if c.cfg.Verbose {
-				fmt.Fprintf(os.Stderr,"[CDX]  no results for %s — retrying with %s\n", rawURL, alt)
+				c.logf("[CDX]  no results for %s — retrying with %s", rawURL, alt)
 			}
 			snaps, err = c.fetchCDX(ctx, alt)
 			if err != nil {
 				// Non-fatal: log and return empty.
 				if c.cfg.Verbose {
-					fmt.Fprintf(os.Stderr,"[WARN] alt-scheme CDX query failed: %v\n", err)
+					c.logf("[WARN] alt-scheme CDX query failed: %v", err)
 				}
 				return nil, nil
 			}
@@ -113,7 +123,7 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 func (c *Client) fetchCDX(ctx context.Context, targetURL string) ([]provider.Snapshot, error) {
 	apiURL := c.buildCDXURL(targetURL)
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr,"[CDX]  %s\n", apiURL)
+		c.logf("[CDX]  %s", apiURL)
 	}
 
 	var (
@@ -215,9 +225,11 @@ func (c *Client) get(ctx context.Context, apiURL string) ([]byte, time.Duration,
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		wait := ratelimit.ParseRetryAfter(resp.Header.Get("Retry-After"), 30*time.Second)
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, wait, &cdxError{code: resp.StatusCode}
 	}
 	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, 0, &cdxError{code: resp.StatusCode}
 	}
 
@@ -265,7 +277,7 @@ func cdxBackoff(attempt int) time.Duration {
 func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provider.Snapshot, error) {
 	apiURL := c.buildHostCDXURL(host)
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr, "[wayback] host inventory: %s\n", apiURL)
+		c.logf("[wayback] host inventory: %s", apiURL)
 	}
 
 	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
@@ -303,15 +315,18 @@ func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provide
 			if c.limiter != nil {
 				c.limiter.SetPause(wait)
 			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
 			fmt.Fprintf(os.Stderr, "[WAIT] CDX rate-limited — pausing %.0fs\n", wait.Seconds())
 			continue
 		}
 		if resp.StatusCode == http.StatusNotFound {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
 			return nil, nil
 		}
 		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
 			resp.Body.Close()
 			if attempt < c.cfg.Retries {
 				continue

@@ -68,12 +68,21 @@ func New(cfg *config.Config, opts ...Option) *Client {
 // Name implements provider.Provider.
 func (c *Client) Name() string { return "archiveph" }
 
+// logf routes a verbose message through cfg.LogVerbose or stderr fallback.
+func (c *Client) logf(format string, args ...any) {
+	if c.cfg.LogVerbose != nil {
+		c.cfg.LogVerbose(format, args...)
+	} else {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
 // FetchSnapshots queries the archive.ph timemap for all snapshots of the given URL.
 // 4xx responses are treated as "no results" (archive.ph blocks bots aggressively).
 func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.Snapshot, error) {
 	timemapURL := c.timemapBase + rawURL
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr,"[archiveph] timemap: %s\n", timemapURL)
+		c.logf("[archiveph] timemap: %s", timemapURL)
 	}
 
 	if c.limiter != nil {
@@ -98,11 +107,13 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 	// unmemoised URLs and 403/429 when blocking bots.
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		if c.cfg.Verbose {
-			fmt.Fprintf(os.Stderr,"[archiveph] HTTP %d — skipping\n", resp.StatusCode)
+			c.logf("[archiveph] HTTP %d — skipping", resp.StatusCode)
 		}
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, fmt.Errorf("archive.ph timemap HTTP %d", resp.StatusCode)
 	}
 

@@ -45,6 +45,12 @@ type Config struct {
 	CCBurst          int     // burst size for the CC CDX rate limiter
 	DLWorkers        int     // parallel download workers per URL in 'all' mode
 	HostQueryLimit   int     // max CDX records per host inventory query (0 = no limit)
+
+	// LogVerbose is called instead of fmt.Fprintf(os.Stderr,...) for verbose
+	// informational messages when Verbose is true.  When nil, output falls back
+	// to os.Stderr.  main.go sets this to disp.Info so that TTY-mode verbose
+	// logs are serialized through the display lock and don't corrupt the panel.
+	LogVerbose func(format string, args ...any)
 }
 
 // Parse parses CLI flags and returns a validated Config.

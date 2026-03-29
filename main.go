@@ -82,6 +82,12 @@ func main() {
 	disp.Banner(cfg.Mode, cfg.Providers)
 	disp.Start()
 
+	// Route provider verbose logs through the display's locked Info method so
+	// they don't race with the ANSI panel in TTY mode.
+	if cfg.Verbose {
+		cfg.LogVerbose = disp.Info
+	}
+
 	if cfg.Verbose {
 		disp.Info("host-first strategy: %d unique host(s) from %d URL(s)", countHosts(jobs), len(jobs))
 		disp.Info("rate limiter: %.1f req/s burst %d | cc-rps: %.1f burst %d",

@@ -13,8 +13,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +36,41 @@ const (
 	defaultDataBase    = "https://data.commoncrawl.org"
 	timestampLayout    = "20060102150405"
 )
+
+// ccBackoff returns jittered exponential back-off before retry attempt (1-based).
+// Caps at ~8 s: ~1 s, ~2 s, ~4 s, ~8 s.
+func ccBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	exp := attempt - 1
+	if exp > 3 {
+		exp = 3
+	}
+	base := time.Duration(1<<uint(exp)) * time.Second
+	jitter := time.Duration(rand.Int63n(int64(base) + 1))
+	return base + jitter
+}
+
+// ccHTTPError carries an HTTP status code for CC CDX or WARC requests so
+// retry decisions can be made without inspecting error strings.
+type ccHTTPError struct{ code int }
+
+func (e *ccHTTPError) Error() string { return fmt.Sprintf("CC HTTP %d", e.code) }
+
+// isCCRetryable returns true for errors that are worth retrying.
+func isCCRetryable(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var he *ccHTTPError
+	if errors.As(err, &he) {
+		return he.code == http.StatusTooManyRequests ||
+			(he.code >= 500 && he.code < 600)
+	}
+	// Network / transport errors (timeouts, resets) are retryable.
+	return true
+}
 
 // collection represents one Common Crawl index collection entry.
 type collection struct {
@@ -108,6 +145,15 @@ func New(cfg *config.Config, opts ...Option) *Client {
 // Name implements provider.Provider.
 func (c *Client) Name() string { return "commoncrawl" }
 
+// logf routes a verbose message through cfg.LogVerbose or stderr fallback.
+func (c *Client) logf(format string, args ...any) {
+	if c.cfg.LogVerbose != nil {
+		c.cfg.LogVerbose(format, args...)
+	} else {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
 // FetchSnapshots queries up to cfg.CCMaxCollections Common Crawl collections
 // for snapshots of rawURL.  All collections are queried in parallel; for
 // oldest/newest mode the remaining queries are cancelled after the first
@@ -141,7 +187,7 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 			snaps, qErr := c.queryCDX(collCtx, colls[i].CDXAPI, rawURL)
 			if qErr != nil {
 				if c.cfg.Verbose && collCtx.Err() == nil {
-					fmt.Fprintf(os.Stderr,"[commoncrawl] collection %s error: %v\n", colls[i].ID, qErr)
+					c.logf("[commoncrawl] collection %s error: %v", colls[i].ID, qErr)
 				}
 				ch <- collResult{id: colls[i].ID}
 				return
@@ -206,7 +252,7 @@ func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provide
 			snaps, qErr := c.queryHostCDX(collCtx, colls[i].CDXAPI, host)
 			if qErr != nil {
 				if c.cfg.Verbose && collCtx.Err() == nil {
-					fmt.Fprintf(os.Stderr, "[commoncrawl] host inventory %s error: %v\n", colls[i].ID, qErr)
+					c.logf("[commoncrawl] host CDX %s error: %v", colls[i].ID, qErr)
 				}
 				ch <- collResult{}
 				return
@@ -236,38 +282,72 @@ func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provide
 }
 
 // queryHostCDX fetches all snapshots for url=host/* from one CC CDX endpoint.
+// It retries on 429 (honoring Retry-After via the shared limiter) and 5xx.
 func (c *Client) queryHostCDX(ctx context.Context, cdxAPI, host string) ([]provider.Snapshot, error) {
 	apiURL := c.buildHostCDXURL(cdxAPI, host)
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr, "[commoncrawl] host CDX: %s\n", apiURL)
+		c.logf("[commoncrawl] host CDX: %s", apiURL)
 	}
 
-	if c.limiter != nil {
-		if err := c.limiter.Wait(ctx); err != nil {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			wait := ccBackoff(attempt)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
 			return nil, err
 		}
-	}
+		req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, err
+		}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := ratelimit.ParseRetryAfter(resp.Header.Get("Retry-After"), 30*time.Second)
+			if c.limiter != nil {
+				c.limiter.SetPause(wait)
+			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			continue // limiter.Wait on next iteration will observe the pause
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			return nil, nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			he := &ccHTTPError{code: resp.StatusCode}
+			if isCCRetryable(he) && attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, he
+		}
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
+		snaps, err := c.parseCDXNDJSON(resp.Body, host)
+		resp.Body.Close()
+		return snaps, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("host CDX HTTP %d", resp.StatusCode)
-	}
-
-	return c.parseCDXNDJSON(resp.Body, host)
+	return nil, fmt.Errorf("host CDX failed after %d attempt(s)", c.cfg.Retries+1)
 }
 
 func (c *Client) buildHostCDXURL(cdxAPI, host string) string {
@@ -314,6 +394,7 @@ func (c *Client) fetchCollections(ctx context.Context) ([]collection, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, fmt.Errorf("collinfo HTTP %d", resp.StatusCode)
 	}
 
@@ -327,35 +408,68 @@ func (c *Client) fetchCollections(ctx context.Context) ([]collection, error) {
 func (c *Client) queryCDX(ctx context.Context, cdxAPI, targetURL string) ([]provider.Snapshot, error) {
 	apiURL := c.buildCDXURL(cdxAPI, targetURL)
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr,"[commoncrawl] CDX: %s\n", apiURL)
+		c.logf("[commoncrawl] CDX: %s", apiURL)
 	}
 
-	if c.limiter != nil {
-		if err := c.limiter.Wait(ctx); err != nil {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			wait := ccBackoff(attempt)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
 			return nil, err
 		}
-	}
+		req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, err
+		}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := ratelimit.ParseRetryAfter(resp.Header.Get("Retry-After"), 30*time.Second)
+			if c.limiter != nil {
+				c.limiter.SetPause(wait)
+			}
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			return nil, nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+			he := &ccHTTPError{code: resp.StatusCode}
+			if isCCRetryable(he) && attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, he
+		}
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
+		snaps, err := c.parseCDXNDJSON(resp.Body, targetURL)
+		resp.Body.Close()
+		return snaps, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("CDX HTTP %d", resp.StatusCode)
-	}
-
-	return c.parseCDXNDJSON(resp.Body, targetURL)
+	return nil, fmt.Errorf("CDX failed after %d attempt(s)", c.cfg.Retries+1)
 }
 
 func (c *Client) buildCDXURL(cdxAPI, targetURL string) string {
@@ -434,19 +548,19 @@ func (c *Client) parseCDXNDJSON(r io.Reader, fallbackURL string) ([]provider.Sna
 //
 // WARC byte-range metadata (_warcOffset, _warcLength) is read from the
 // synthetic query params that parseCDXNDJSON embedded in snap.ArchiveURL.
+// Transient HTTP 5xx and network errors are retried up to cfg.Retries times.
 func (c *Client) FetchContent(ctx context.Context, snap provider.Snapshot, destPath string) error {
+	// Parse WARC metadata once — these are permanent errors if they fail.
 	u, parseErr := url.Parse(snap.ArchiveURL)
 	if parseErr != nil {
 		return fmt.Errorf("parse archive URL: %w", parseErr)
 	}
-
 	q := u.Query()
 	offsetStr := q.Get("_warcOffset")
 	lengthStr := q.Get("_warcLength")
 	if offsetStr == "" || lengthStr == "" {
 		return fmt.Errorf("WARC metadata missing from archive URL %q", snap.ArchiveURL)
 	}
-
 	offset, err := strconv.ParseInt(offsetStr, 10, 64)
 	if err != nil || offset < 0 {
 		return fmt.Errorf("invalid WARC offset %q", offsetStr)
@@ -455,17 +569,42 @@ func (c *Client) FetchContent(ctx context.Context, snap provider.Snapshot, destP
 	if err != nil || length <= 0 {
 		return fmt.Errorf("invalid WARC length %q", lengthStr)
 	}
-
-	// Strip our synthetic params to produce the real S3 data URL.
+	// Strip synthetic params to get the real S3 data URL.
 	q.Del("_warcOffset")
 	q.Del("_warcLength")
 	u.RawQuery = q.Encode()
 	dataURL := u.String()
 
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr,"[commoncrawl] WARC %s bytes=%d-%d\n", dataURL, offset, offset+length-1)
+		c.logf("[commoncrawl] WARC %s bytes=%d-%d", dataURL, offset, offset+length-1)
 	}
 
+	var lastErr error
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			wait := ccBackoff(attempt)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+		if err := c.fetchWARCRecord(ctx, dataURL, offset, length, destPath); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if !isCCRetryable(err) {
+				break
+			}
+		}
+	}
+	return fmt.Errorf("WARC fetch failed after %d attempt(s): %w", c.cfg.Retries+1, lastErr)
+}
+
+// fetchWARCRecord performs a single attempt of the WARC byte-range download:
+// rate-limit wait → Range GET → gzip decompress → WARC header skip →
+// HTTP response parse → atomic write to destPath.
+func (c *Client) fetchWARCRecord(ctx context.Context, dataURL string, offset, length int64, destPath string) error {
 	if c.limiter != nil {
 		if err := c.limiter.Wait(ctx); err != nil {
 			return err
@@ -486,7 +625,8 @@ func (c *Client) FetchContent(ctx context.Context, snap provider.Snapshot, destP
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("WARC byte-range fetch HTTP %d", resp.StatusCode)
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		return &ccHTTPError{code: resp.StatusCode}
 	}
 
 	// Decompress the gzip-compressed WARC record.

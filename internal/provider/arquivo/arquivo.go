@@ -70,11 +70,20 @@ func New(cfg *config.Config, opts ...Option) *Client {
 // Name implements provider.Provider.
 func (c *Client) Name() string { return "arquivo" }
 
+// logf routes a verbose message through cfg.LogVerbose or stderr fallback.
+func (c *Client) logf(format string, args ...any) {
+	if c.cfg.LogVerbose != nil {
+		c.cfg.LogVerbose(format, args...)
+	} else {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
 // FetchSnapshots queries the Arquivo.pt CDX API for snapshots of rawURL.
 func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.Snapshot, error) {
 	apiURL := c.buildCDXURL(rawURL)
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr,"[arquivo] CDX: %s\n", apiURL)
+		c.logf("[arquivo] CDX: %s", apiURL)
 	}
 
 	if c.limiter != nil {
@@ -96,9 +105,11 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, fmt.Errorf("arquivo CDX HTTP %d", resp.StatusCode)
 	}
 
@@ -109,7 +120,7 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provider.Snapshot, error) {
 	apiURL := c.buildHostInventoryURL(host)
 	if c.cfg.Verbose {
-		fmt.Fprintf(os.Stderr, "[arquivo] host inventory: %s\n", apiURL)
+		c.logf("[arquivo] host inventory: %s", apiURL)
 	}
 
 	if c.limiter != nil {
@@ -131,9 +142,11 @@ func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provide
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
 		return nil, fmt.Errorf("arquivo host CDX HTTP %d", resp.StatusCode)
 	}
 
