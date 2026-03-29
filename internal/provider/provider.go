@@ -30,3 +30,16 @@ type Provider interface {
 	// Returns nil, nil when no snapshots exist (not an error).
 	FetchSnapshots(ctx context.Context, url string) ([]Snapshot, error)
 }
+
+// HostInventoryFetcher is an optional interface for archive providers that
+// support retrieving all archived URLs for a given hostname in one batch
+// request.  Implementing this interface lets the caller issue one CDX query
+// per unique host instead of one per user-supplied URL — a dramatic reduction
+// when processing many URLs from the same domain.
+type HostInventoryFetcher interface {
+	// FetchHostInventory returns all snapshots for URLs under host.
+	// The result is filtered by the provider's configured StatusFilter and
+	// capped by HostQueryLimit.  The caller applies mode selection and
+	// deduplication via selector.Select.
+	FetchHostInventory(ctx context.Context, host string) ([]Snapshot, error)
+}

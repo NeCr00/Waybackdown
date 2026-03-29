@@ -105,6 +105,56 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 	return parseNDJSON(resp.Body, rawURL)
 }
 
+// FetchHostInventory implements provider.HostInventoryFetcher.
+func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provider.Snapshot, error) {
+	apiURL := c.buildHostInventoryURL(host)
+	if c.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[arquivo] host inventory: %s\n", apiURL)
+	}
+
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("arquivo host CDX HTTP %d", resp.StatusCode)
+	}
+
+	return parseNDJSON(resp.Body, "")
+}
+
+func (c *Client) buildHostInventoryURL(host string) string {
+	p := url.Values{}
+	p.Set("url", host+"/*")
+	p.Set("output", "json")
+
+	if c.cfg.StatusFilter != "" {
+		p.Set("filter", "statuscode:"+c.cfg.StatusFilter)
+	}
+	if c.cfg.HostQueryLimit > 0 {
+		p.Set("limit", strconv.Itoa(c.cfg.HostQueryLimit))
+	}
+
+	return c.cdxEndpoint + "?" + p.Encode()
+}
+
 func (c *Client) buildCDXURL(targetURL string) string {
 	p := url.Values{}
 	p.Set("url", targetURL)

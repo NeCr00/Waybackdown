@@ -29,7 +29,22 @@ func FilePath(outputDir string, snap provider.Snapshot) (string, error) {
 		return "", fmt.Errorf("parse original URL: %w", err)
 	}
 
-	host := sanitize(u.Host)
+	// Build a clean host component that mirrors URLKey normalization so that
+	// all snapshots of the same logical host land in the same directory:
+	//   • lowercase hostname (u.Hostname strips the port)
+	//   • strip "www." prefix — CDX entries captured as www.X.com:80 belong
+	//     to the same site and should not create a separate www.X.com_80/ dir
+	//   • omit standard ports (80/443) — http://host:80/ == http://host/
+	//   • retain non-standard ports to distinguish e.g. host:8080 from host
+	hostName := strings.ToLower(u.Hostname())
+	if strings.HasPrefix(hostName, "www.") {
+		hostName = hostName[4:]
+	}
+	port := u.Port()
+	if port != "" && port != "80" && port != "443" {
+		hostName += ":" + port
+	}
+	host := sanitize(hostName)
 	// Collapse any ".." sequences that survive sanitize (dots are allowed by the
 	// regex) to prevent path traversal when filepath.Join resolves the host
 	// component against the output directory.
@@ -49,6 +64,10 @@ func FilePath(outputDir string, snap provider.Snapshot) (string, error) {
 	if pathPart == "" {
 		pathPart = "root"
 	}
+	// Guard against ".." surviving sanitizePath (dots are allowed by unsafeChars).
+	// A CDX OriginalURL with path "/.."+  would produce pathPart=".." which lets
+	// filepath.Join escape the host-scoped subdirectory inside the output dir.
+	pathPart = strings.ReplaceAll(pathPart, "..", "_")
 	// Guard against extremely long path components (filesystem limit ~255 chars).
 	// Keep the first 160 chars readable, append an 8-hex-char CRC for uniqueness.
 	if len(pathPart) > 200 {

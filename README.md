@@ -1,7 +1,8 @@
 # waybackdown
 
-Download historical web snapshots from multiple public archives.
-Queries Wayback Machine, archive.ph, Common Crawl, and Arquivo.pt **in parallel** — the highest-priority provider with results wins; the rest are cancelled.
+Download historical web snapshots from multiple public archives using a **host-first strategy** that minimises CDX requests.
+
+Instead of one archive query per URL, the tool extracts all unique hostnames from the input list, queries each archive **once per host** to retrieve its full URL inventory, then matches that inventory against the user's list — dramatically reducing API calls when many input URLs share the same domain.
 
 ## Install
 
@@ -13,17 +14,18 @@ go install github.com/NeCr00/Waybackdown@latest
 ## Usage
 
 ```
-waybackdown -u <url> [options]
+waybackdown -u <url> [-u <url> ...] [options]
 waybackdown -l <file> [options]
+cat urls.txt | waybackdown [options]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-u` | | Single URL to download |
+| `-u` | | URL to download (repeatable: `-u url1 -u url2`) |
 | `-l` | | File with one URL per line |
 | `-mode` | `newest` | `oldest` · `newest` · `all` |
 | `-o` | `waybackdown_output` | Output directory |
-| `-c` | `10` | Concurrent URL workers |
+| `-c` | `10` | Hosts processed concurrently per provider |
 | `-max` | `0` (unlimited) | Max snapshots per URL in `all` mode |
 | `-status` | `` (all) | Filter by HTTP status at capture time (e.g. `200`) |
 | `-providers` | `wayback,archiveph,commoncrawl,arquivo` | Provider priority order |
@@ -31,7 +33,8 @@ waybackdown -l <file> [options]
 | `-burst` | `20` | Rate limiter burst size |
 | `-cc-rps` | `5.0` | Common Crawl CDX requests/second (independent of `-rps`) |
 | `-cc-burst` | `20` | CC CDX rate limiter burst size |
-| `-cc-max` | `3` | Max Common Crawl index collections to query per URL |
+| `-cc-max` | `3` | Max Common Crawl index collections to query per host |
+| `-host-limit` | `100000` | Max CDX records per host inventory query (0 = no limit) |
 | `-dl-workers` | `4` | Parallel download workers per URL in `all` mode |
 | `-timeout` | `30s` | Per-request HTTP timeout |
 | `-retries` | `3` | Retries on transient failures |
@@ -43,18 +46,50 @@ waybackdown -l <file> [options]
 # Newest snapshot of a single URL
 waybackdown -u https://target.com
 
-# All historical versions, verbose
+# All historical versions of a URL, verbose
 waybackdown -u https://target.com -mode all -v
 
 # Only successful (200 OK) captures
 waybackdown -u https://target.com/login.php -mode all -status 200
 
-# Bulk download from a URL list, 10 workers
-waybackdown -l urls.txt -mode all -c 10 -o ./archives
+# Multiple URLs via repeated -u flags (single host → 1 CDX query)
+waybackdown -u https://target.com -u https://target.com/login -u https://target.com/admin -mode newest
 
-# Wayback + Common Crawl only, higher rate limit
+# Bulk list: one host-level query covers all URLs from the same domain
+waybackdown -l urls.txt -mode newest -o ./archives
+
+# Piped input from another tool
+cat urls.txt | waybackdown -mode all -status 200
+
+# Wayback + Common Crawl only
 waybackdown -l urls.txt -providers wayback,commoncrawl -rps 10 -burst 40
 ```
+
+## How it works
+
+```
+Input URLs  →  extract unique hosts  →  deduplicate
+                        │
+             ┌──────────▼──────────┐
+             │  Provider 1 (Wayback)│
+             │  query: host/*       │  ← one CDX request per host
+             │  match user URLs     │
+             │  download matches    │
+             └──────────┬──────────┘
+                        │ unresolved URLs only
+             ┌──────────▼──────────┐
+             │  Provider 2 (archiveph) │
+             │  per-URL fallback    │  ← no host query support
+             └──────────┬──────────┘
+                        │ unresolved URLs only
+             ┌──────────▼──────────┐
+             │  Provider 3 (CC)    │  ← host/* across all collections
+             └──────────┬──────────┘
+                        │ still not found
+                   "not found in any archive"
+```
+
+**Request savings example:** 500 URLs from `example.com` → 1 CDX request instead of 500.
 
 ## Output structure
 
@@ -70,11 +105,11 @@ Files are written atomically. Re-running skips already-downloaded snapshots (res
 
 ## Providers
 
-| Provider | Source |
-|----------|--------|
-| `wayback` | web.archive.org CDX API |
-| `archiveph` | archive.ph Memento timemap |
-| `commoncrawl` | index.commoncrawl.org CDX + WARC byte-range |
-| `arquivo` | arquivo.pt CDX API |
+| Provider | Source | Host-level query |
+|----------|--------|-----------------|
+| `wayback` | web.archive.org CDX API | ✓ (`url=host/*`) |
+| `archiveph` | archive.ph Memento timemap | ✗ (per-URL fallback) |
+| `commoncrawl` | index.commoncrawl.org CDX + WARC byte-range | ✓ (`url=host/*` per collection) |
+| `arquivo` | arquivo.pt CDX API | ✓ (`url=host/*`) |
 
-All configured providers are queried **simultaneously**.  The highest-priority provider (leftmost in `-providers`) that returns results wins; remaining in-flight queries are cancelled.  Common Crawl collections are also queried in parallel, independently rate-limited via `-cc-rps`.
+Providers are tried in priority order. Each provider only receives URLs not resolved by earlier providers. For providers without host-level support, individual URL queries are used as fallback.

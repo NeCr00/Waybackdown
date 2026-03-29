@@ -247,13 +247,166 @@ func cdxBackoff(attempt int) time.Duration {
 	if attempt <= 0 {
 		return 0
 	}
-	exp := attempt - 1
-	if exp > 3 {
-		exp = 3 // base cap 8s
-	}
+	exp := min(attempt-1, 3) // base cap 8s
 	base := time.Duration(1<<uint(exp)) * time.Second // 1, 2, 4, 8
 	jitter := time.Duration(rand.Int63n(int64(base) + 1))
 	return base + jitter
+}
+
+// FetchHostInventory implements provider.HostInventoryFetcher.
+// It issues one CDX query for url=host/* and streams the JSON array response
+// so very large result sets do not need to be buffered in memory before
+// parsing.
+//
+// Mode-specific server-side collapsing:
+//   - oldest: collapse=urlkey          → one oldest snapshot per URL
+//   - newest: collapse=urlkey&sort=reverse → one newest snapshot per URL
+//   - all:    no collapse              → every snapshot; caller deduplicates
+func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provider.Snapshot, error) {
+	apiURL := c.buildHostCDXURL(host)
+	if c.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[wayback] host inventory: %s\n", apiURL)
+	}
+
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			wait := cdxBackoff(attempt)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, fmt.Errorf("host inventory request: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := ratelimit.ParseRetryAfter(resp.Header.Get("Retry-After"), 30*time.Second)
+			if c.limiter != nil {
+				c.limiter.SetPause(wait)
+			}
+			resp.Body.Close()
+			fmt.Fprintf(os.Stderr, "[WAIT] CDX rate-limited — pausing %.0fs\n", wait.Seconds())
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return nil, nil
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, fmt.Errorf("CDX HTTP %d", resp.StatusCode)
+		}
+
+		snaps, parseErr := parseStreamCDX(resp.Body)
+		resp.Body.Close()
+		return snaps, parseErr
+	}
+	return nil, fmt.Errorf("host inventory failed after %d attempts", c.cfg.Retries+1)
+}
+
+func (c *Client) buildHostCDXURL(host string) string {
+	p := url.Values{}
+	p.Set("url", host+"/*")
+	p.Set("output", "json")
+	p.Set("fl", "original,timestamp,statuscode,mimetype,digest")
+
+	if c.cfg.StatusFilter != "" {
+		p.Set("filter", "statuscode:"+c.cfg.StatusFilter)
+	}
+
+	switch c.cfg.Mode {
+	case config.ModeOldest:
+		// collapse=urlkey keeps the first (oldest) record per URL.
+		p.Set("collapse", "urlkey")
+	case config.ModeNewest:
+		// sort=reverse then collapse=urlkey keeps the newest record per URL.
+		p.Set("collapse", "urlkey")
+		p.Set("sort", "reverse")
+	case config.ModeAll:
+		// No collapse — return every snapshot; selector.Select handles dedup.
+	}
+
+	if c.cfg.HostQueryLimit > 0 {
+		p.Set("limit", strconv.Itoa(c.cfg.HostQueryLimit))
+	}
+
+	return c.cdxEndpoint + "?" + p.Encode()
+}
+
+// parseStreamCDX decodes a Wayback CDX JSON array-of-arrays response from r
+// using json.Decoder so the response body is never fully buffered in memory.
+func parseStreamCDX(r io.Reader) ([]provider.Snapshot, error) {
+	dec := json.NewDecoder(r)
+
+	tok, err := dec.Token()
+	if err == io.EOF {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("CDX stream: %w", err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+		return nil, fmt.Errorf("CDX stream: expected '[', got %v", tok)
+	}
+
+	var colIdx map[string]int
+	var snaps []provider.Snapshot
+
+	for dec.More() {
+		var row []string
+		if err := dec.Decode(&row); err != nil {
+			continue
+		}
+		if colIdx == nil {
+			colIdx = make(map[string]int, len(row))
+			for i, name := range row {
+				colIdx[name] = i
+			}
+			continue
+		}
+
+		tsStr := col(row, colIdx, "timestamp")
+		ts, err := time.Parse(timestampLayout, tsStr)
+		if err != nil {
+			continue
+		}
+		orig := col(row, colIdx, "original")
+		if orig == "" {
+			continue
+		}
+		archiveURL := fmt.Sprintf("%s/%s%s/%s", archiveBase, tsStr, archiveSuffix, orig)
+		snaps = append(snaps, provider.Snapshot{
+			OriginalURL: orig,
+			ArchiveURL:  archiveURL,
+			Timestamp:   ts,
+			StatusCode:  col(row, colIdx, "statuscode"),
+			MIMEType:    col(row, colIdx, "mimetype"),
+			Digest:      col(row, colIdx, "digest"),
+		})
+	}
+	return snaps, nil
 }
 
 // parseCDX parses the CDX JSON array-of-arrays response.

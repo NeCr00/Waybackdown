@@ -175,6 +175,117 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 	return snaps, nil
 }
 
+// FetchHostInventory implements provider.HostInventoryFetcher.
+// It queries up to cfg.CCMaxCollections CC index collections in parallel
+// using url=host/* and merges the results, deduplicating by digest.
+func (c *Client) FetchHostInventory(ctx context.Context, host string) ([]provider.Snapshot, error) {
+	colls, err := c.getCollections(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get collections: %w", err)
+	}
+	if len(colls) == 0 {
+		return nil, nil
+	}
+
+	maxColls := c.cfg.CCMaxCollections
+	if maxColls <= 0 || maxColls > len(colls) {
+		maxColls = len(colls)
+	}
+
+	type collResult struct {
+		snaps []provider.Snapshot
+	}
+
+	ch := make(chan collResult, maxColls)
+	collCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for i := 0; i < maxColls; i++ {
+		i := i
+		go func() {
+			snaps, qErr := c.queryHostCDX(collCtx, colls[i].CDXAPI, host)
+			if qErr != nil {
+				if c.cfg.Verbose && collCtx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "[commoncrawl] host inventory %s error: %v\n", colls[i].ID, qErr)
+				}
+				ch <- collResult{}
+				return
+			}
+			ch <- collResult{snaps: snaps}
+		}()
+	}
+
+	seen := make(map[string]struct{})
+	var all []provider.Snapshot
+
+	for i := 0; i < maxColls; i++ {
+		r := <-ch
+		for _, s := range r.snaps {
+			key := s.Digest
+			if key == "" {
+				key = s.ArchiveURL
+			}
+			if _, dup := seen[key]; !dup {
+				seen[key] = struct{}{}
+				all = append(all, s)
+			}
+		}
+	}
+
+	return all, nil
+}
+
+// queryHostCDX fetches all snapshots for url=host/* from one CC CDX endpoint.
+func (c *Client) queryHostCDX(ctx context.Context, cdxAPI, host string) ([]provider.Snapshot, error) {
+	apiURL := c.buildHostCDXURL(cdxAPI, host)
+	if c.cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[commoncrawl] host CDX: %s\n", apiURL)
+	}
+
+	if c.limiter != nil {
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "waybackdown/1.0 (archive downloader)")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("host CDX HTTP %d", resp.StatusCode)
+	}
+
+	return c.parseCDXNDJSON(resp.Body, host)
+}
+
+func (c *Client) buildHostCDXURL(cdxAPI, host string) string {
+	p := url.Values{}
+	p.Set("url", host+"/*")
+	p.Set("output", "json")
+	p.Set("fl", "timestamp,status,mime,digest,filename,offset,length,url")
+
+	if c.cfg.StatusFilter != "" {
+		p.Set("filter", "status:"+c.cfg.StatusFilter)
+	}
+	if c.cfg.HostQueryLimit > 0 {
+		p.Set("limit", strconv.Itoa(c.cfg.HostQueryLimit))
+	}
+
+	return cdxAPI + "?" + p.Encode()
+}
+
 // getCollections returns the cached collection list, fetching it on first call.
 func (c *Client) getCollections(ctx context.Context) ([]collection, error) {
 	c.collOnce.Do(func() {
