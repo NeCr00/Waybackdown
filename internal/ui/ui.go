@@ -315,6 +315,15 @@ func (d *Display) DlWarn(normalized, ts string, err error) {
 		d.c(yellow, "[!]"), normalized, ts, err.Error()))
 }
 
+// Interrupted prints a notice that the run was cut short by a signal.
+// Call after Stop() and before Summary().
+func (d *Display) Interrupted() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.printContent(fmt.Sprintf("\n%s\n\n",
+		d.c(boldRed, "  interrupted — partial results saved")))
+}
+
 // Summary erases the live panel and prints the final stats block.
 // Call Stop() before Summary().
 func (d *Display) Summary() {

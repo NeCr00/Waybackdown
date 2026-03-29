@@ -132,13 +132,23 @@ func main() {
 	}
 
 interrupted:
-	// Anything still pending was not found in any archive.
+	wasInterrupted := ctx.Err() != nil
 	for _, j := range pending {
-		disp.Skip(j.input, "not found in any archive")
+		if wasInterrupted {
+			disp.Skip(j.input, "interrupted")
+		} else {
+			disp.Skip(j.input, "not found in any archive")
+		}
 	}
 
 	disp.Stop()
+	if wasInterrupted {
+		disp.Interrupted()
+	}
 	disp.Summary()
+	if wasInterrupted {
+		os.Exit(130)
+	}
 }
 
 // buildJobs normalises each raw URL, computes its URLKey and host, and
