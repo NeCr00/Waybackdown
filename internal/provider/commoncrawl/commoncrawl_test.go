@@ -197,14 +197,17 @@ func TestFetchSnapshots_DeduplicatesByDigest(t *testing.T) {
 	}
 }
 
-func TestFetchSnapshots_EarlyExitForNewest(t *testing.T) {
-	var cdxCalls int
+// TestFetchSnapshots_ParallelNewestReturnsResults verifies that FetchSnapshots
+// returns valid snapshots in newest mode when multiple collections are queried
+// in parallel.  (Previously this test checked for sequential early-exit; with
+// parallel queries all collections fire simultaneously and cancellation is
+// best-effort for in-flight requests.)
+func TestFetchSnapshots_ParallelNewestReturnsResults(t *testing.T) {
 	cdxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cdxCalls++
 		rec := cdxRecord{
 			URL: "https://example.com/", Timestamp: "20240101120000",
 			Filename: "f.warc.gz", Offset: "0", Length: "1000",
-			Digest: fmt.Sprintf("SHA1:%d", cdxCalls), // unique per call to avoid dedup
+			Digest: "SHA1:ABCD",
 		}
 		b, _ := json.Marshal(rec)
 		fmt.Fprintf(w, "%s\n", b)
@@ -229,9 +232,13 @@ func TestFetchSnapshots_EarlyExitForNewest(t *testing.T) {
 		WithCollInfoURL(collinfoSrv.URL),
 		WithHTTPClient(collinfoSrv.Client()),
 	)
-	c.FetchSnapshots(context.Background(), "https://example.com/")
-	if cdxCalls != 1 {
-		t.Errorf("expected 1 CDX call for newest mode (early exit), got %d", cdxCalls)
+	snaps, err := c.FetchSnapshots(context.Background(), "https://example.com/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Deduplication by digest means identical records across collections collapse to 1.
+	if len(snaps) == 0 {
+		t.Error("expected at least one snapshot, got 0")
 	}
 }
 

@@ -109,8 +109,9 @@ func New(cfg *config.Config, opts ...Option) *Client {
 func (c *Client) Name() string { return "commoncrawl" }
 
 // FetchSnapshots queries up to cfg.CCMaxCollections Common Crawl collections
-// for snapshots of rawURL.  Collections are tried newest-first; for
-// oldest/newest mode the loop exits early after the first result is found.
+// for snapshots of rawURL.  All collections are queried in parallel; for
+// oldest/newest mode the remaining queries are cancelled after the first
+// non-empty result is received.
 func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.Snapshot, error) {
 	colls, err := c.getCollections(ctx)
 	if err != nil {
@@ -125,23 +126,41 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 		maxColls = len(colls)
 	}
 
+	type collResult struct {
+		id    string
+		snaps []provider.Snapshot
+	}
+
+	ch := make(chan collResult, maxColls)
+	collCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for i := 0; i < maxColls; i++ {
+		i := i
+		go func() {
+			snaps, qErr := c.queryCDX(collCtx, colls[i].CDXAPI, rawURL)
+			if qErr != nil {
+				if c.cfg.Verbose && collCtx.Err() == nil {
+					fmt.Fprintf(os.Stderr,"[commoncrawl] collection %s error: %v\n", colls[i].ID, qErr)
+				}
+				ch <- collResult{id: colls[i].ID}
+				return
+			}
+			ch <- collResult{id: colls[i].ID, snaps: snaps}
+			// For oldest/newest mode, cancel remaining queries as soon as we
+			// have results — their responses would only add duplicates.
+			if len(snaps) > 0 && c.cfg.Mode != config.ModeAll {
+				cancel()
+			}
+		}()
+	}
+
 	seen := make(map[string]struct{})
 	var snaps []provider.Snapshot
 
 	for i := 0; i < maxColls; i++ {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		collSnaps, err := c.queryCDX(ctx, colls[i].CDXAPI, rawURL)
-		if err != nil {
-			if c.cfg.Verbose {
-				fmt.Printf("[commoncrawl] collection %s error: %v\n", colls[i].ID, err)
-			}
-			continue
-		}
-
-		for _, s := range collSnaps {
+		r := <-ch
+		for _, s := range r.snaps {
 			key := s.Digest
 			if key == "" {
 				key = s.ArchiveURL
@@ -150,11 +169,6 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 				seen[key] = struct{}{}
 				snaps = append(snaps, s)
 			}
-		}
-
-		// For oldest/newest mode, stop as soon as we have any results.
-		if len(snaps) > 0 && c.cfg.Mode != config.ModeAll {
-			break
 		}
 	}
 
@@ -202,7 +216,7 @@ func (c *Client) fetchCollections(ctx context.Context) ([]collection, error) {
 func (c *Client) queryCDX(ctx context.Context, cdxAPI, targetURL string) ([]provider.Snapshot, error) {
 	apiURL := c.buildCDXURL(cdxAPI, targetURL)
 	if c.cfg.Verbose {
-		fmt.Printf("[commoncrawl] CDX: %s\n", apiURL)
+		fmt.Fprintf(os.Stderr,"[commoncrawl] CDX: %s\n", apiURL)
 	}
 
 	if c.limiter != nil {
@@ -338,7 +352,7 @@ func (c *Client) FetchContent(ctx context.Context, snap provider.Snapshot, destP
 	dataURL := u.String()
 
 	if c.cfg.Verbose {
-		fmt.Printf("[commoncrawl] WARC %s bytes=%d-%d\n", dataURL, offset, offset+length-1)
+		fmt.Fprintf(os.Stderr,"[commoncrawl] WARC %s bytes=%d-%d\n", dataURL, offset, offset+length-1)
 	}
 
 	if c.limiter != nil {

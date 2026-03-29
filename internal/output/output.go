@@ -30,6 +30,10 @@ func FilePath(outputDir string, snap provider.Snapshot) (string, error) {
 	}
 
 	host := sanitize(u.Host)
+	// Collapse any ".." sequences that survive sanitize (dots are allowed by the
+	// regex) to prevent path traversal when filepath.Join resolves the host
+	// component against the output directory.
+	host = strings.ReplaceAll(host, "..", "_")
 	if host == "" {
 		host = "unknown_host"
 	}

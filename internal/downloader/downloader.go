@@ -143,7 +143,7 @@ func (d *Downloader) downloadOnce(ctx context.Context, archiveURL, destPath stri
 		if d.limiter != nil {
 			d.limiter.SetPause(wait)
 		}
-		fmt.Printf("[WAIT] download rate-limited — pausing %.0fs (Retry-After)\n", wait.Seconds())
+		fmt.Fprintf(os.Stderr,"[WAIT] download rate-limited — pausing %.0fs (Retry-After)\n", wait.Seconds())
 		return &httpStatusError{code: resp.StatusCode}
 	}
 

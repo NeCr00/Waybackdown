@@ -1,7 +1,7 @@
 # waybackdown
 
 Download historical web snapshots from multiple public archives.
-Queries Wayback Machine, archive.ph, Common Crawl, and Arquivo.pt in fallback order.
+Queries Wayback Machine, archive.ph, Common Crawl, and Arquivo.pt **in parallel** — the highest-priority provider with results wins; the rest are cancelled.
 
 ## Install
 
@@ -23,15 +23,18 @@ waybackdown -l <file> [options]
 | `-l` | | File with one URL per line |
 | `-mode` | `newest` | `oldest` · `newest` · `all` |
 | `-o` | `waybackdown_output` | Output directory |
-| `-c` | `5` | Concurrent URL workers |
+| `-c` | `10` | Concurrent URL workers |
 | `-max` | `0` (unlimited) | Max snapshots per URL in `all` mode |
 | `-status` | `` (all) | Filter by HTTP status at capture time (e.g. `200`) |
-| `-providers` | `wayback,archiveph,commoncrawl,arquivo` | Fallback order |
-| `-rps` | `2.0` | Max requests/second (0 = unlimited) |
-| `-burst` | `10` | Rate limiter burst size |
+| `-providers` | `wayback,archiveph,commoncrawl,arquivo` | Provider priority order |
+| `-rps` | `5.0` | Requests/second for downloads + non-CC CDX (0 = unlimited) |
+| `-burst` | `20` | Rate limiter burst size |
+| `-cc-rps` | `5.0` | Common Crawl CDX requests/second (independent of `-rps`) |
+| `-cc-burst` | `20` | CC CDX rate limiter burst size |
+| `-cc-max` | `3` | Max Common Crawl index collections to query per URL |
+| `-dl-workers` | `4` | Parallel download workers per URL in `all` mode |
 | `-timeout` | `30s` | Per-request HTTP timeout |
 | `-retries` | `3` | Retries on transient failures |
-| `-cc-max` | `3` | Max Common Crawl collections to query per URL |
 | `-v` | | Verbose output |
 
 ## Examples
@@ -50,7 +53,7 @@ waybackdown -u https://target.com/login.php -mode all -status 200
 waybackdown -l urls.txt -mode all -c 10 -o ./archives
 
 # Wayback + Common Crawl only, higher rate limit
-waybackdown -l urls.txt -providers wayback,commoncrawl -rps 5 -burst 20
+waybackdown -l urls.txt -providers wayback,commoncrawl -rps 10 -burst 40
 ```
 
 ## Output structure
@@ -74,4 +77,4 @@ Files are written atomically. Re-running skips already-downloaded snapshots (res
 | `commoncrawl` | index.commoncrawl.org CDX + WARC byte-range |
 | `arquivo` | arquivo.pt CDX API |
 
-Providers are tried in order; the first one returning results wins.
+All configured providers are queried **simultaneously**.  The highest-priority provider (leftmost in `-providers`) that returns results wins; remaining in-flight queries are cancelled.  Common Crawl collections are also queried in parallel, independently rate-limited via `-cc-rps`.

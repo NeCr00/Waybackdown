@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -72,7 +73,7 @@ func (c *Client) Name() string { return "archiveph" }
 func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.Snapshot, error) {
 	timemapURL := c.timemapBase + rawURL
 	if c.cfg.Verbose {
-		fmt.Printf("[archiveph] timemap: %s\n", timemapURL)
+		fmt.Fprintf(os.Stderr,"[archiveph] timemap: %s\n", timemapURL)
 	}
 
 	if c.limiter != nil {
@@ -97,7 +98,7 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 	// unmemoised URLs and 403/429 when blocking bots.
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		if c.cfg.Verbose {
-			fmt.Printf("[archiveph] HTTP %d — skipping\n", resp.StatusCode)
+			fmt.Fprintf(os.Stderr,"[archiveph] HTTP %d — skipping\n", resp.StatusCode)
 		}
 		return nil, nil
 	}

@@ -25,10 +25,13 @@ type Config struct {
 	Verbose          bool
 	MaxSnapshots     int
 	StatusFilter     string  // e.g. "200" — empty means no filter
-	RPS              float64 // max HTTP requests per second (0 = unlimited)
+	RPS              float64 // max HTTP requests per second for downloads + non-CC CDX (0 = unlimited)
 	BurstSize        int     // token-bucket burst capacity
 	Providers        string  // comma-separated provider names in fallback order
 	CCMaxCollections int     // max Common Crawl collections to query per URL
+	CCRPS            float64 // Common Crawl CDX requests/second (separate, higher limit)
+	CCBurst          int     // burst size for the CC CDX rate limiter
+	DLWorkers        int     // parallel download workers per URL in 'all' mode
 }
 
 // Parse parses CLI flags and returns a validated Config.
@@ -39,21 +42,27 @@ func Parse() *Config {
 	flag.StringVar(&cfg.URLFile, "l", "", "path to a file containing one URL per line")
 	flag.StringVar(&cfg.Mode, "mode", ModeNewest, "snapshot selection mode: oldest | newest | all")
 	flag.StringVar(&cfg.OutputDir, "o", "waybackdown_output", "root output directory for downloaded files")
-	flag.IntVar(&cfg.Concurrency, "c", 5, "number of URLs to process concurrently")
+	flag.IntVar(&cfg.Concurrency, "c", 10, "number of URLs to process concurrently")
 	flag.DurationVar(&cfg.Timeout, "timeout", 30*time.Second, "HTTP request timeout per request")
 	flag.IntVar(&cfg.Retries, "retries", 3, "max retries on transient HTTP/network failures")
 	flag.BoolVar(&cfg.Verbose, "v", false, "verbose output (individual snapshot URLs and paths)")
 	flag.IntVar(&cfg.MaxSnapshots, "max", 0, "max snapshots per URL in 'all' mode (0 = no limit)")
 	flag.StringVar(&cfg.StatusFilter, "status", "",
 		"filter CDX snapshots by HTTP status code (empty = all statuses; use '200' for successful captures only)")
-	flag.Float64Var(&cfg.RPS, "rps", 2.0,
-		"max HTTP requests/second across all workers (0 = unlimited; shared rate limiter)")
-	flag.IntVar(&cfg.BurstSize, "burst", 10,
+	flag.Float64Var(&cfg.RPS, "rps", 5.0,
+		"max HTTP requests/second for downloads + non-CC CDX queries (0 = unlimited)")
+	flag.IntVar(&cfg.BurstSize, "burst", 20,
 		"token-bucket burst size for the rate limiter (only used when -rps > 0)")
 	flag.StringVar(&cfg.Providers, "providers", "wayback,archiveph,commoncrawl,arquivo",
 		"comma-separated archive providers in fallback order (wayback,archiveph,commoncrawl,arquivo)")
 	flag.IntVar(&cfg.CCMaxCollections, "cc-max", 3,
 		"max Common Crawl index collections to query per URL (0 = all)")
+	flag.Float64Var(&cfg.CCRPS, "cc-rps", 5.0,
+		"Common Crawl CDX requests/second (independent of -rps; 0 = unlimited)")
+	flag.IntVar(&cfg.CCBurst, "cc-burst", 20,
+		"burst size for the Common Crawl CDX rate limiter")
+	flag.IntVar(&cfg.DLWorkers, "dl-workers", 4,
+		"parallel download workers per URL in 'all' mode")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "waybackdown — download archived URL snapshots from multiple web archives\n\n")
@@ -96,6 +105,12 @@ func Parse() *Config {
 	}
 	if cfg.BurstSize < 1 {
 		cfg.BurstSize = 1
+	}
+	if cfg.CCBurst < 1 {
+		cfg.CCBurst = 1
+	}
+	if cfg.DLWorkers < 1 {
+		cfg.DLWorkers = 1
 	}
 
 	return cfg

@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/NeCr00/Waybackdown/internal/config"
 	"github.com/NeCr00/Waybackdown/internal/downloader"
@@ -21,6 +23,7 @@ import (
 	"github.com/NeCr00/Waybackdown/internal/provider/wayback"
 	"github.com/NeCr00/Waybackdown/internal/ratelimit"
 	"github.com/NeCr00/Waybackdown/internal/selector"
+	"github.com/NeCr00/Waybackdown/internal/transport"
 	"github.com/NeCr00/Waybackdown/internal/ui"
 )
 
@@ -42,12 +45,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Shared transport pools TCP+TLS connections across all providers and
+	// the downloader, eliminating repeated handshake overhead.
+	tr := transport.New()
+
+	// Global rate limiter: governs downloads and non-CC CDX queries.
 	var limiter *ratelimit.Limiter
 	if cfg.RPS > 0 {
 		limiter = ratelimit.New(cfg.RPS, cfg.BurstSize)
 	}
 
-	providers := buildProviders(cfg, limiter)
+	// Separate, more permissive rate limiter for Common Crawl CDX queries.
+	var ccLimiter *ratelimit.Limiter
+	if cfg.CCRPS > 0 {
+		ccLimiter = ratelimit.New(cfg.CCRPS, cfg.CCBurst)
+	}
+
+	providers := buildProviders(cfg, limiter, ccLimiter, tr)
 	if len(providers) == 0 {
 		fmt.Fprintln(os.Stderr, "error: no valid providers specified (check -providers flag)")
 		os.Exit(1)
@@ -59,14 +73,22 @@ func main() {
 
 	if cfg.Verbose {
 		disp.Info("rate limiter: %.1f req/s, burst %d", cfg.RPS, cfg.BurstSize)
+		disp.Info("CC rate limiter: %.1f req/s, burst %d", cfg.CCRPS, cfg.CCBurst)
+		disp.Info("concurrency: %d URLs  dl-workers: %d/URL", cfg.Concurrency, cfg.DLWorkers)
 		names := make([]string, len(providers))
 		for i, p := range providers {
 			names[i] = p.Name()
 		}
-		disp.Info("providers: %s", strings.Join(names, " → "))
+		disp.Info("providers (parallel fan-out): %s", strings.Join(names, " | "))
 	}
 
-	dl := downloader.New(cfg, downloader.WithLimiter(limiter))
+	dl := downloader.New(cfg,
+		downloader.WithLimiter(limiter),
+		downloader.WithHTTPClient(&http.Client{
+			Transport: tr,
+			Timeout:   cfg.Timeout,
+		}),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -145,26 +167,128 @@ type contentFetcher interface {
 }
 
 // buildProviders constructs the ordered provider slice from cfg.Providers.
-func buildProviders(cfg *config.Config, limiter *ratelimit.Limiter) []provider.Provider {
+// All providers share the tuned transport tr; each gets an appropriate
+// per-timeout HTTP client and the relevant rate limiter.
+func buildProviders(cfg *config.Config, limiter, ccLimiter *ratelimit.Limiter, tr *http.Transport) []provider.Provider {
+	makeClient := func(mult time.Duration) *http.Client {
+		return &http.Client{Transport: tr, Timeout: cfg.Timeout * mult}
+	}
+
 	var providers []provider.Provider
 	for _, name := range strings.Split(cfg.Providers, ",") {
 		name = strings.TrimSpace(strings.ToLower(name))
 		switch name {
 		case "wayback":
-			providers = append(providers, wayback.New(cfg, wayback.WithLimiter(limiter)))
+			providers = append(providers, wayback.New(cfg,
+				wayback.WithLimiter(limiter),
+				wayback.WithHTTPClient(makeClient(3))))
 		case "archiveph":
-			providers = append(providers, archiveph.New(cfg, archiveph.WithLimiter(limiter)))
+			providers = append(providers, archiveph.New(cfg,
+				archiveph.WithLimiter(limiter),
+				archiveph.WithHTTPClient(makeClient(2))))
 		case "commoncrawl":
-			providers = append(providers, commoncrawl.New(cfg, commoncrawl.WithLimiter(limiter)))
+			providers = append(providers, commoncrawl.New(cfg,
+				commoncrawl.WithLimiter(ccLimiter),
+				commoncrawl.WithHTTPClient(makeClient(3))))
 		case "arquivo":
-			providers = append(providers, arquivo.New(cfg, arquivo.WithLimiter(limiter)))
+			providers = append(providers, arquivo.New(cfg,
+				arquivo.WithLimiter(limiter),
+				arquivo.WithHTTPClient(makeClient(2))))
 		}
 	}
 	return providers
 }
 
-// processURL normalises, queries providers in fallback order, selects
-// snapshots, and downloads them.
+// fetchWithFallback queries all providers concurrently and returns the first
+// non-empty result, honouring provider priority order (lower index = higher
+// priority).  Once a winner is determined (all higher-priority providers have
+// returned), the remaining goroutines are cancelled to avoid wasting tokens.
+func fetchWithFallback(
+	ctx context.Context,
+	rawURL string,
+	providers []provider.Provider,
+	cfg *config.Config,
+	disp *ui.Display,
+) ([]provider.Snapshot, provider.Provider) {
+	n := len(providers)
+	if n == 0 {
+		return nil, nil
+	}
+
+	type result struct {
+		idx   int
+		snaps []provider.Snapshot
+		p     provider.Provider
+	}
+
+	fanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ch := make(chan result, n)
+	for i, p := range providers {
+		i, p := i, p
+		go func() {
+			snaps, err := p.FetchSnapshots(fanCtx, rawURL)
+			if err != nil {
+				if cfg.Verbose && fanCtx.Err() == nil {
+					disp.Info("%s: fetch failed: %v", p.Name(), err)
+				}
+				ch <- result{idx: i, p: p}
+				return
+			}
+			if cfg.Verbose {
+				if len(snaps) > 0 {
+					disp.Info("%s: %d snapshot(s) found", p.Name(), len(snaps))
+				} else {
+					disp.Info("%s: no snapshots", p.Name())
+				}
+			}
+			ch <- result{idx: i, snaps: snaps, p: p}
+		}()
+	}
+
+	// pending tracks which provider indices are still running.
+	pending := make(map[int]bool, n)
+	for i := range providers {
+		pending[i] = true
+	}
+
+	bestIdx := n // sentinel: no winner yet
+	var bestSnaps []provider.Snapshot
+	var bestProvider provider.Provider
+
+	for len(pending) > 0 {
+		r := <-ch
+		delete(pending, r.idx)
+
+		if len(r.snaps) > 0 && r.idx < bestIdx {
+			bestIdx = r.idx
+			bestSnaps = r.snaps
+			bestProvider = r.p
+		}
+
+		// Declare a winner once no pending provider has a higher priority
+		// (lower index) than the current best.
+		if bestIdx < n {
+			higherPriorityPending := false
+			for pendIdx := range pending {
+				if pendIdx < bestIdx {
+					higherPriorityPending = true
+					break
+				}
+			}
+			if !higherPriorityPending {
+				cancel() // cancel remaining lower-priority queries
+				return bestSnaps, bestProvider
+			}
+		}
+	}
+
+	return bestSnaps, bestProvider
+}
+
+// processURL normalises, queries all providers in parallel (fallback by
+// priority), selects snapshots, and downloads them with parallel workers.
 func processURL(
 	ctx context.Context,
 	rawURL string,
@@ -183,28 +307,7 @@ func processURL(
 		disp.Info("querying %s", normalized)
 	}
 
-	var snapshots []provider.Snapshot
-	var usedProvider provider.Provider
-	for _, p := range providers {
-		snaps, fetchErr := p.FetchSnapshots(ctx, normalized)
-		if fetchErr != nil {
-			if cfg.Verbose {
-				disp.Info("%s: fetch failed: %v", p.Name(), fetchErr)
-			}
-			continue
-		}
-		if len(snaps) > 0 {
-			snapshots = snaps
-			usedProvider = p
-			if cfg.Verbose {
-				disp.Info("%s: %d snapshot(s) found", p.Name(), len(snaps))
-			}
-			break
-		}
-		if cfg.Verbose {
-			disp.Info("%s: no snapshots — trying next provider", p.Name())
-		}
-	}
+	snapshots, usedProvider := fetchWithFallback(ctx, normalized, providers, cfg, disp)
 
 	if len(snapshots) == 0 {
 		return 0, 0, 0, true, "no snapshots found in any archive", nil
@@ -218,11 +321,29 @@ func processURL(
 
 	fetcher, hasFetcher := usedProvider.(contentFetcher)
 
-	for _, snap := range selected {
-		if ctx.Err() != nil {
-			return newFiles, cached, dlFailed, false, "", ctx.Err()
-		}
+	newFiles, cached, dlFailed = downloadAll(ctx, selected, cfg, dl, fetcher, hasFetcher, normalized, disp)
+	return newFiles, cached, dlFailed, false, "", nil
+}
 
+// downloadAll downloads all selected snapshots using a pool of cfg.DLWorkers
+// goroutines.  Cache hits are detected synchronously before queuing.
+func downloadAll(
+	ctx context.Context,
+	selected []provider.Snapshot,
+	cfg *config.Config,
+	dl *downloader.Downloader,
+	fetcher contentFetcher,
+	hasFetcher bool,
+	normalized string,
+	disp *ui.Display,
+) (newFiles, cached, dlFailed int) {
+	type job struct {
+		snap     provider.Snapshot
+		destPath string
+	}
+
+	jobs := make([]job, 0, len(selected))
+	for _, snap := range selected {
 		destPath, pathErr := output.FilePath(cfg.OutputDir, snap)
 		if pathErr != nil {
 			if cfg.Verbose {
@@ -230,7 +351,6 @@ func processURL(
 			}
 			continue
 		}
-
 		if _, statErr := os.Stat(destPath); statErr == nil {
 			if cfg.Verbose {
 				disp.Info("cached: %s", destPath)
@@ -238,27 +358,58 @@ func processURL(
 			cached++
 			continue
 		}
-
 		if cfg.Verbose {
 			disp.Down(snap.ArchiveURL, destPath)
 		}
-
-		var dlErr error
-		if hasFetcher {
-			dlErr = fetcher.FetchContent(ctx, snap, destPath)
-		} else {
-			dlErr = dl.Download(ctx, snap.ArchiveURL, destPath)
-		}
-
-		if dlErr != nil {
-			disp.DlWarn(normalized, snap.Timestamp.Format("20060102"), dlErr)
-			dlFailed++
-			continue
-		}
-		newFiles++
+		jobs = append(jobs, job{snap: snap, destPath: destPath})
 	}
 
-	return newFiles, cached, dlFailed, false, "", nil
+	if len(jobs) == 0 {
+		return 0, cached, 0
+	}
+
+	workers := cfg.DLWorkers
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+
+	jobCh := make(chan job, len(jobs))
+	for _, j := range jobs {
+		jobCh <- j
+	}
+	close(jobCh)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobCh {
+				if ctx.Err() != nil {
+					return
+				}
+				var dlErr error
+				if hasFetcher {
+					dlErr = fetcher.FetchContent(ctx, j.snap, j.destPath)
+				} else {
+					dlErr = dl.Download(ctx, j.snap.ArchiveURL, j.destPath)
+				}
+				mu.Lock()
+				if dlErr != nil {
+					disp.DlWarn(normalized, j.snap.Timestamp.Format("20060102"), dlErr)
+					dlFailed++
+				} else {
+					newFiles++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return newFiles, cached, dlFailed
 }
 
 // collectURLs reads URLs from -u and/or -l, deduplicates, strips comments.

@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -91,13 +92,13 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 		alt := normalize.ToggleScheme(rawURL)
 		if alt != rawURL {
 			if c.cfg.Verbose {
-				fmt.Printf("[CDX]  no results for %s — retrying with %s\n", rawURL, alt)
+				fmt.Fprintf(os.Stderr,"[CDX]  no results for %s — retrying with %s\n", rawURL, alt)
 			}
 			snaps, err = c.fetchCDX(ctx, alt)
 			if err != nil {
 				// Non-fatal: log and return empty.
 				if c.cfg.Verbose {
-					fmt.Printf("[WARN] alt-scheme CDX query failed: %v\n", err)
+					fmt.Fprintf(os.Stderr,"[WARN] alt-scheme CDX query failed: %v\n", err)
 				}
 				return nil, nil
 			}
@@ -112,7 +113,7 @@ func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.
 func (c *Client) fetchCDX(ctx context.Context, targetURL string) ([]provider.Snapshot, error) {
 	apiURL := c.buildCDXURL(targetURL)
 	if c.cfg.Verbose {
-		fmt.Printf("[CDX]  %s\n", apiURL)
+		fmt.Fprintf(os.Stderr,"[CDX]  %s\n", apiURL)
 	}
 
 	var (
@@ -149,7 +150,7 @@ func (c *Client) fetchCDX(ctx context.Context, targetURL string) ([]provider.Sna
 			if c.limiter != nil {
 				c.limiter.SetPause(retryAfter)
 			}
-			fmt.Printf("[WAIT] CDX rate-limited — pausing %.0fs (Retry-After)\n",
+			fmt.Fprintf(os.Stderr,"[WAIT] CDX rate-limited — pausing %.0fs (Retry-After)\n",
 				retryAfter.Seconds())
 		}
 

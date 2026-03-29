@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -73,7 +74,7 @@ func (c *Client) Name() string { return "arquivo" }
 func (c *Client) FetchSnapshots(ctx context.Context, rawURL string) ([]provider.Snapshot, error) {
 	apiURL := c.buildCDXURL(rawURL)
 	if c.cfg.Verbose {
-		fmt.Printf("[arquivo] CDX: %s\n", apiURL)
+		fmt.Fprintf(os.Stderr,"[arquivo] CDX: %s\n", apiURL)
 	}
 
 	if c.limiter != nil {
